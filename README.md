@@ -1,5 +1,5 @@
 # A-TIG-my-master-student-Seyyed-Moein-Fareqi
-This repository contains the complete code and workflow used in my latest article, developed and executed in Google Colab
+This repository contains the complete code and workflow used in my latest article, developed and executed in Google Colab (best parameter file is the hyperparameter tuned csv and results file is the sample A-TIG tests)
 # 📘 WAAM Modeling with XGBoost, Ridge & Uncertainty Quantification
 
 This repository contains the **complete code and workflow** from my latest article, fully executed and validated in **Google Colab**.  
