@@ -1,0 +1,1009 @@
+!pip install --quiet xgboost scikit-learn shap optuna pandas numpy matplotlib seaborn joblib openpyxl scipy
+
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras import layers
+import tensorflow_probability as tfp
+
+from google.colab import files
+uploaded = files.upload()
+
+# Stage 1: Load + map columns by position
+import pandas as pd
+import numpy as np
+
+DATA_PATH = "results.xlsx"   # change if necessary
+
+# --- Load ---
+df = pd.read_excel(DATA_PATH)
+print("Raw file columns:", df.columns.tolist())
+print("Shape:", df.shape)
+display(df.head())
+
+# --- Map columns by position (based on your description) ---
+# col0: test number, col1: current, col2: flux type, last 3 cols: outputs (DOP, width, aspect_ratio)
+cols = df.columns.tolist()
+if len(cols) < 5:
+    raise ValueError("Expected at least 5 columns (test_no, current, flux, DOP, width, aspect_ratio).")
+
+INPUT_COLS = [cols[1], cols[2]]        # current, flux-type
+TARGET_COLS = cols[-3:]                # last 3 columns -> DOP, width, aspect_ratio
+
+print("INPUT_COLS:", INPUT_COLS)
+print("TARGET_COLS:", TARGET_COLS)
+
+# --- Basic cleaning ---
+# drop rows with NA in any input or target
+df = df.dropna(subset=INPUT_COLS + TARGET_COLS).reset_index(drop=True)
+print("After dropping NA, shape:", df.shape)
+
+# Quick summary
+print(df[INPUT_COLS + TARGET_COLS].describe(include='all'))
+
+
+Stage 2 — Preprocessing & train/val/test split
+
+This cell encodes the categorical flux-type and creates the train/val/test splits (60/20/20). It also returns ready-to-use NumPy arrays and a preprocessing pipeline you can reuse.
+
+# === Stage 2 (corrected): Preprocessing + train/val/test split (robust OneHotEncoder) ===
+import inspect
+from sklearn.model_selection import train_test_split
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.compose import ColumnTransformer
+import numpy as np
+import pandas as pd
+
+# (assumes df, INPUT_COLS, TARGET_COLS already defined from Stage 1)
+numeric_feats = [INPUT_COLS[0]]      # e.g. 'current'
+categorical_feats = [INPUT_COLS[1]]  # e.g. 'flux type'
+
+# Create OneHotEncoder in a way that works across sklearn versions:
+ohe_params = inspect.signature(OneHotEncoder).parameters
+if "sparse" in ohe_params:
+    # older sklearn versions
+    ohe = OneHotEncoder(handle_unknown="ignore", sparse=False)
+elif "sparse_output" in ohe_params:
+    # newer sklearn versions
+    ohe = OneHotEncoder(handle_unknown="ignore", sparse_output=False)
+else:
+    # fallback: be conservative (may produce sparse matrix)
+    ohe = OneHotEncoder(handle_unknown="ignore")
+
+# Preprocessor: scale numeric, one-hot encode categorical
+preprocessor = ColumnTransformer(
+    transformers=[
+        ("num", StandardScaler(), numeric_feats),
+        ("cat", ohe, categorical_feats)
+    ],
+    remainder="drop"
+)
+
+# Split: Train 60%, Val 20%, Test 20% (reproducible)
+train_val_df, test_df = train_test_split(df, test_size=0.2, random_state=42, shuffle=True)
+train_df, val_df = train_test_split(train_val_df, test_size=0.25, random_state=42, shuffle=True)  # 0.25*0.8 = 0.2
+
+print("Split sizes - Train:", train_df.shape, "Val:", val_df.shape, "Test:", test_df.shape)
+
+# Prepare X/y
+def make_xy(dframe):
+    X = dframe[INPUT_COLS].copy()
+    y = dframe[TARGET_COLS].copy()
+    return X, y
+
+X_train, y_train = make_xy(train_df)
+X_val,   y_val   = make_xy(val_df)
+X_test,  y_test  = make_xy(test_df)
+
+# Fit preprocessor on train only
+preprocessor.fit(X_train)
+
+# Transform sets (results should be dense arrays thanks to encoder params)
+X_train_p = preprocessor.transform(X_train)
+X_val_p   = preprocessor.transform(X_val)
+X_test_p  = preprocessor.transform(X_test)
+
+print("Preprocessed feature shapes:", X_train_p.shape, X_val_p.shape, X_test_p.shape)
+
+# Build feature names list robustly:
+feature_names = []
+# numeric names
+feature_names += numeric_feats
+
+# categorical OHE names
+cat_transformer = preprocessor.named_transformers_.get("cat", None)
+if cat_transformer is not None:
+    # try get_feature_names_out first
+    if hasattr(cat_transformer, "get_feature_names_out"):
+        try:
+            ohe_feature_names = list(cat_transformer.get_feature_names_out(categorical_feats))
+        except Exception:
+            # some sklearn versions expect no args
+            ohe_feature_names = list(cat_transformer.get_feature_names_out())
+    elif hasattr(cat_transformer, "get_feature_names"):
+        # older method returns names like 'flux_type_x'
+        try:
+            ohe_feature_names = list(cat_transformer.get_feature_names(categorical_feats))
+        except Exception:
+            ohe_feature_names = list(cat_transformer.get_feature_names())
+    else:
+        # fallback to generic names using observed categories
+        ohe_feature_names = []
+        if hasattr(cat_transformer, "categories_"):
+            for col, cats in zip(categorical_feats, cat_transformer.categories_):
+                ohe_feature_names += [f"{col}_{str(c)}" for c in cats]
+        else:
+            ohe_feature_names = [f"{categorical_feats[0]}_{i}" for i in range(X_train_p.shape[1] - len(numeric_feats))]
+
+    feature_names += ohe_feature_names
+
+print("Final feature names:", feature_names)
+
+
+
+Stage 3 — Exploratory Data Analysis (EDA)
+
+Run this cell to produce correlation heatmap, scatter per feature vs each target, and boxplot of targets by flux type.
+
+# Stage 3: EDA
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# Convert preprocessed arrays back to DataFrame for plotting
+X_full = pd.DataFrame(preprocessor.transform(df[INPUT_COLS]), columns=feature_names)
+full_df = pd.concat([X_full.reset_index(drop=True), df[TARGET_COLS].reset_index(drop=True)], axis=1)
+
+# 1) Correlation heatmap (features vs targets)
+corr = full_df.corr()
+plt.figure(figsize=(8,6))
+sns.heatmap(corr.loc[feature_names, TARGET_COLS], annot=True, fmt=".2f", cmap="coolwarm")
+plt.title("Input (processed) vs Outputs correlation")
+plt.tight_layout()
+plt.show()
+
+# 2) Scatter: current vs each target
+for t in TARGET_COLS:
+    plt.figure(figsize=(5,4))
+    sns.scatterplot(data=df, x=INPUT_COLS[0], y=t, hue=INPUT_COLS[1], palette="tab10")
+    plt.title(f"{INPUT_COLS[0]} vs {t} (color=flux)")
+    plt.tight_layout()
+    plt.show()
+
+# 3) Boxplots of each target grouped by flux
+for t in TARGET_COLS:
+    plt.figure(figsize=(6,4))
+    sns.boxplot(data=df, x=INPUT_COLS[1], y=t)
+    plt.title(f"{t} distribution by flux type")
+    plt.tight_layout()
+    plt.show()
+
+
+# Add this to your Stage 3: EDA section
+
+# Input-Input Correlation Heatmap
+plt.figure(figsize=(12, 10))
+
+# Calculate correlation matrix for input features only
+input_corr = X_full.corr()
+
+# Create a mask for the upper triangle
+mask = np.triu(np.ones_like(input_corr, dtype=bool))
+
+# Plot the heatmap
+sns.heatmap(input_corr,
+            mask=mask,
+            annot=True,
+            fmt=".2f",
+            cmap="RdBu_r",  # Red-Blue diverging colormap
+            center=0,
+            square=True,
+            cbar_kws={"shrink": .8})
+
+plt.title("Input Feature Correlation Heatmap")
+plt.tight_layout()
+plt.savefig("input_feature_correlation.png", dpi=300, bbox_inches='tight')
+plt.show()
+
+# Print highly correlated feature pairs (absolute correlation > 0.8)
+print("\nHighly correlated feature pairs (|correlation| > 0.8):")
+high_corr = []
+for i in range(len(input_corr.columns)):
+    for j in range(i+1, len(input_corr.columns)):
+        if abs(input_corr.iloc[i, j]) > 0.8:
+            high_corr.append((input_corr.columns[i], input_corr.columns[j], input_corr.iloc[i, j]))
+
+if high_corr:
+    for pair in high_corr:
+        print(f"{pair[0]} - {pair[1]}: {pair[2]:.3f}")
+else:
+    print("No highly correlated feature pairs found.")
+
+# Stage 4: Baseline linear model (Ridge) per target
+from sklearn.linear_model import Ridge
+from sklearn.pipeline import make_pipeline
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+import numpy as np
+import pandas as pd
+
+def metrics(y_true, y_pred):
+    rmse = np.sqrt(mean_squared_error(y_true, y_pred))
+    mae  = mean_absolute_error(y_true, y_pred)
+    r2   = r2_score(y_true, y_pred)
+    return {"RMSE": rmse, "MAE": mae, "R2": r2}
+
+baseline_results = []
+for target in TARGET_COLS:
+    # We'll train on train split only to compute baseline tests on val/test
+    model = make_pipeline(StandardScaler(), Ridge(random_state=42))
+    # Note: StandardScaler inside pipeline expects raw X (we will supply original X_train)
+    # But we already preprocessed X. For baseline consistency use preprocessed arrays and fit a simple Ridge without extra scaler:
+    model = Ridge(random_state=42)
+    model.fit(X_train_p, y_train[target].values)
+
+    y_train_pred = model.predict(X_train_p)
+    y_val_pred   = model.predict(X_val_p)
+    y_test_pred  = model.predict(X_test_p)
+
+    baseline_results.append({
+        "Target": target,
+        "Split": "train",
+        **metrics(y_train[target].values, y_train_pred)
+    })
+    baseline_results.append({
+        "Target": target,
+        "Split": "val",
+        **metrics(y_val[target].values, y_val_pred)
+    })
+    baseline_results.append({
+        "Target": target,
+        "Split": "test",
+        **metrics(y_test[target].values, y_test_pred)
+    })
+
+baseline_df = pd.DataFrame(baseline_results)
+baseline_df.to_csv("baseline_ridge_results.csv", index=False)
+print(baseline_df)
+
+
+visualization
+
+import matplotlib.pyplot as plt
+import seaborn as sns
+import pandas as pd
+import numpy as np
+from matplotlib.gridspec import GridSpec
+
+# Set publication-quality style
+plt.style.use('seaborn-v0_8-whitegrid')
+sns.set_palette("colorblind")
+plt.rcParams.update({
+    'font.family': 'serif',
+    'font.serif': ['Times New Roman', 'DejaVu Serif'],
+    'font.size': 12,
+    'axes.labelsize': 14,
+    'axes.titlesize': 16,
+    'xtick.labelsize': 12,
+    'ytick.labelsize': 12,
+    'legend.fontsize': 12,
+    'figure.titlesize': 18,
+    'figure.dpi': 300,
+    'savefig.dpi': 300,
+    'savefig.bbox': 'tight',
+    'savefig.pad_inches': 0.1
+})
+
+# Read your results
+baseline_df = pd.read_csv("baseline_ridge_results.csv")
+
+# 1. Main metrics comparison across targets and splits
+fig = plt.figure(figsize=(15, 10))
+gs = GridSpec(2, 2, figure=fig)
+
+# RMSE plot
+ax1 = fig.add_subplot(gs[0, 0])
+sns.barplot(data=baseline_df, x='Target', y='RMSE', hue='Split', ax=ax1, alpha=0.85)
+ax1.set_title('RMSE Comparison')
+ax1.set_ylabel('RMSE')
+ax1.tick_params(axis='x', rotation=45)
+ax1.legend(title='Data Split')
+
+# MAE plot
+ax2 = fig.add_subplot(gs[0, 1])
+sns.barplot(data=baseline_df, x='Target', y='MAE', hue='Split', ax=ax2, alpha=0.85)
+ax2.set_title('MAE Comparison')
+ax2.set_ylabel('MAE')
+ax2.tick_params(axis='x', rotation=45)
+ax2.legend(title='Data Split')
+
+# R² plot
+ax3 = fig.add_subplot(gs[1, 0])
+sns.barplot(data=baseline_df, x='Target', y='R2', hue='Split', ax=ax3, alpha=0.85)
+ax3.set_title('R² Score Comparison')
+ax3.set_ylabel('R²')
+ax3.tick_params(axis='x', rotation=45)
+ax3.legend(title='Data Split')
+
+# Performance gap (difference between train and test)
+performance_gap = []
+for target in baseline_df['Target'].unique():
+    train_r2 = baseline_df[(baseline_df['Target'] == target) & (baseline_df['Split'] == 'train')]['R2'].values[0]
+    test_r2 = baseline_df[(baseline_df['Target'] == target) & (baseline_df['Split'] == 'test')]['R2'].values[0]
+    performance_gap.append({'Target': target, 'R2 Gap': train_r2 - test_r2})
+
+gap_df = pd.DataFrame(performance_gap)
+ax4 = fig.add_subplot(gs[1, 1])
+sns.barplot(data=gap_df, x='Target', y='R2 Gap', ax=ax4, color='salmon', alpha=0.85)
+ax4.set_title('Generalization Gap (Train R² - Test R²)')
+ax4.set_ylabel('R² Difference')
+ax4.tick_params(axis='x', rotation=45)
+ax4.axhline(y=0, color='black', linestyle='-', alpha=0.3)
+
+plt.tight_layout()
+plt.savefig('figure1_baseline_metrics_comprehensive.png', dpi=300)
+plt.show()
+
+# 2. Heatmap of performance metrics
+fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+
+# Pivot the data for heatmaps
+rmse_pivot = baseline_df.pivot(index='Target', columns='Split', values='RMSE')
+mae_pivot = baseline_df.pivot(index='Target', columns='Split', values='MAE')
+r2_pivot = baseline_df.pivot(index='Target', columns='Split', values='R2')
+
+# RMSE heatmap
+sns.heatmap(rmse_pivot, annot=True, fmt='.3f', cmap='YlOrRd', ax=axes[0], cbar_kws={'label': 'RMSE'})
+axes[0].set_title('RMSE Across Targets and Splits')
+
+# MAE heatmap
+sns.heatmap(mae_pivot, annot=True, fmt='.3f', cmap='YlOrRd', ax=axes[1], cbar_kws={'label': 'MAE'})
+axes[1].set_title('MAE Across Targets and Splits')
+
+# R² heatmap
+sns.heatmap(r2_pivot, annot=True, fmt='.3f', cmap='YlGnBu', ax=axes[2], cbar_kws={'label': 'R²'})
+axes[2].set_title('R² Across Targets and Splits')
+
+plt.tight_layout()
+plt.savefig('figure2_metrics_heatmaps.png', dpi=300)
+plt.show()
+
+# 3. Radar chart for model performance comparison
+def create_radar_chart(df, title, filename):
+    categories = list(df['Target'].unique())
+    N = len(categories)
+
+    # Split the data
+    train_data = df[df['Split'] == 'train']
+    val_data = df[df['Split'] == 'val']
+    test_data = df[df['Split'] == 'test']
+
+    # What will be the angle of each axis in the plot
+    angles = [n / float(N) * 2 * np.pi for n in range(N)]
+    angles += angles[:1]  # Complete the circle
+
+    # Initialise the spider plot
+    fig, ax = plt.subplots(figsize=(10, 10), subplot_kw=dict(polar=True))
+
+    # Helper function to plot each split
+    def add_to_radar(values, label, color):
+        values += values[:1]  # Complete the circle
+        ax.plot(angles, values, linewidth=2, linestyle='solid', label=label, color=color)
+        ax.fill(angles, values, alpha=0.1, color=color)
+
+    # Plot each split
+    add_to_radar(train_data['R2'].tolist(), 'Train', 'blue')
+    add_to_radar(val_data['R2'].tolist(), 'Validation', 'green')
+    add_to_radar(test_data['R2'].tolist(), 'Test', 'red')
+
+    # Add labels
+    ax.set_xticks(angles[:-1])
+    ax.set_xticklabels(categories)
+    ax.set_ylim(0, 1)
+    ax.set_title(title, size=16, y=1.1)
+    ax.legend(loc='upper right', bbox_to_anchor=(0.1, 0.1))
+
+    plt.savefig(filename, dpi=300)
+    plt.show()
+
+create_radar_chart(baseline_df, 'Ridge Regression Performance (R²)', 'figure3_radar_chart.png')
+
+# 4. Performance comparison across splits
+fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+
+# RMSE comparison
+sns.boxplot(data=baseline_df, x='Split', y='RMSE', ax=axes[0])
+sns.stripplot(data=baseline_df, x='Split', y='RMSE', ax=axes[0], color='black', alpha=0.7)
+axes[0].set_title('RMSE Distribution Across Splits')
+
+# MAE comparison
+sns.boxplot(data=baseline_df, x='Split', y='MAE', ax=axes[1])
+sns.stripplot(data=baseline_df, x='Split', y='MAE', ax=axes[1], color='black', alpha=0.7)
+axes[1].set_title('MAE Distribution Across Splits')
+
+# R² comparison
+sns.boxplot(data=baseline_df, x='Split', y='R2', ax=axes[2])
+sns.stripplot(data=baseline_df, x='Split', y='R2', ax=axes[2], color='black', alpha=0.7)
+axes[2].set_title('R² Distribution Across Splits')
+
+plt.tight_layout()
+plt.savefig('figure4_performance_distribution.png', dpi=300)
+plt.show()
+
+# 5. Performance summary table (also save as CSV for inclusion in paper)
+summary_table = baseline_df.groupby(['Target', 'Split']).agg({
+    'RMSE': 'mean',
+    'MAE': 'mean',
+    'R2': 'mean'
+}).round(4).reset_index()
+
+# Pivot for a more readable format
+pivot_table = summary_table.pivot(index='Target', columns='Split', values=['RMSE', 'MAE', 'R2'])
+pivot_table.to_csv('performance_summary_table.csv')
+print("Performance summary table saved as 'performance_summary_table.csv'")
+
+# 6. Correlation between metrics
+fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+
+# Correlation between RMSE and R2
+sns.scatterplot(data=baseline_df, x='RMSE', y='R2', hue='Split', ax=axes[0], s=100)
+axes[0].set_title('Correlation: RMSE vs R²')
+
+# Correlation between MAE and R2
+sns.scatterplot(data=baseline_df, x='MAE', y='R2', hue='Split', ax=axes[1], s=100)
+axes[1].set_title('Correlation: MAE vs R²')
+
+plt.tight_layout()
+plt.savefig('figure5_metrics_correlation.png', dpi=300)
+plt.show()
+
+print("All visualizations completed and saved as high-resolution PNG files.")
+
+import matplotlib.pyplot as plt
+import seaborn as sns
+import numpy as np
+import pandas as pd
+from matplotlib.gridspec import GridSpec
+
+# Set style for professional academic visuals
+plt.style.use('default')
+sns.set_palette("colorblind")
+sns.set_context("paper", font_scale=1.2)
+
+# Load your baseline results
+baseline_df = pd.read_csv("baseline_ridge_results.csv")
+
+# First, let's check the dimensions to understand the issue
+print(f"X_train_p shape: {X_train_p.shape}")
+print(f"Number of input columns (INPUT_COLS): {len(INPUT_COLS)}")
+
+# If there's a mismatch, we need to handle it
+if X_train_p.shape[1] != len(INPUT_COLS):
+    print("Warning: Number of features in X_train_p doesn't match INPUT_COLS length")
+    print("This might be due to preprocessing that expanded categorical variables")
+    
+    # Create generic feature names if there's a mismatch
+    feature_names = [f'Feature_{i}' for i in range(X_train_p.shape[1])]
+    print(f"Using generic feature names: {len(feature_names)} features")
+else:
+    feature_names = INPUT_COLS
+    print("Using original INPUT_COLS as feature names")
+
+# ============================================
+# Revised Coefficient Analysis Function
+# ============================================
+
+def plot_coefficient_analysis(X_train_p, y_train, feature_names, target_cols):
+    """Plot the coefficients of the Ridge regression models"""
+    n_targets = len(target_cols)
+    n_cols = 2
+    n_rows = (n_targets + 1) // n_cols  # Ceiling division
+    
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(15, 5*n_rows))
+    
+    # Flatten axes array for easy indexing
+    if n_targets > 1:
+        axes = axes.flatten()
+    else:
+        axes = [axes]
+    
+    for i, target in enumerate(target_cols):
+        if i >= len(axes):
+            break
+            
+        # Train the model for this specific target
+        model = Ridge(random_state=42)
+        model.fit(X_train_p, y_train[target].values)
+        
+        # Get coefficients
+        coefficients = model.coef_
+        
+        # Create bar plot
+        x_pos = np.arange(len(coefficients))
+        bars = axes[i].bar(x_pos, coefficients)
+        axes[i].set_xlabel('Features')
+        axes[i].set_ylabel('Coefficient Value')
+        axes[i].set_title(f'{target} - Feature Coefficients', fontweight='bold')
+        
+        # Set x-tick labels only if we have reasonable number of features
+        if len(coefficients) <= 20:  # Reasonable number to display
+            axes[i].set_xticks(x_pos)
+            
+            # Rotate labels if they are long
+            if any(len(name) > 5 for name in feature_names):
+                axes[i].set_xticklabels(feature_names, rotation=45, ha='right')
+            else:
+                axes[i].set_xticklabels(feature_names)
+        else:
+            axes[i].set_xlabel('Feature Indices (too many to display)')
+        
+        # Add grid
+        axes[i].grid(True, alpha=0.3, axis='y')
+        
+        # Color positive and negative coefficients differently
+        for j, bar in enumerate(bars):
+            if coefficients[j] >= 0:
+                bar.set_color('blue')
+            else:
+                bar.set_color('red')
+        
+        # Add a horizontal line at zero
+        axes[i].axhline(y=0, color='k', linestyle='-', alpha=0.3)
+    
+    # Hide any unused subplots
+    for i in range(n_targets, len(axes)):
+        axes[i].set_visible(False)
+    
+    plt.suptitle('Ridge Regression Coefficients by Target', fontsize=16, fontweight='bold')
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
+    plt.savefig("baseline_coefficient_analysis.png", dpi=300, bbox_inches='tight')
+    plt.show()
+    
+    # Also create a summary table of the most important features
+    print("\nTop 3 Most Important Features per Target (by absolute coefficient value):")
+    print("=" * 80)
+    
+    for target in target_cols:
+        model = Ridge(random_state=42)
+        model.fit(X_train_p, y_train[target].values)
+        
+        coefficients = model.coef_
+        # Get indices of top 3 features by absolute coefficient value
+        top_indices = np.argsort(np.abs(coefficients))[-3:][::-1]
+        
+        print(f"\n{target}:")
+        for idx in top_indices:
+            feat_name = feature_names[idx] if idx < len(feature_names) else f"Feature_{idx}"
+            print(f"  {feat_name}: {coefficients[idx]:.4f}")
+
+# ============================================
+# Execute the corrected visualization
+# ============================================
+
+print("Creating coefficient analysis visualization...")
+plot_coefficient_analysis(X_train_p, y_train, feature_names, TARGET_COLS)
+
+
+
+Stage 5 — XGBoost: Randomized hyperparameter tuning (per target)
+
+This cell runs a RandomizedSearchCV for each output (safer / lighter than full Bayes for many users). It saves the best params to xgb_best_params.csv. This step can take time depending on n_iter — adjust n_iter as needed.
+
+# Add to your imports at the top
+import optuna
+from sklearn.metrics import mean_squared_error, r2_score
+import xgboost as xgb
+# Replace your Stage 5 (RandomizedSearchCV) with this Optuna implementation
+
+# Stage 5: XGBoost hyperparameter tuning with Optuna
+print("Starting Optuna hyperparameter optimization...")
+
+def objective(trial, X_train, y_train, X_val, y_val):
+    # Define hyperparameter search space
+    param = {
+        "n_estimators": trial.suggest_int("n_estimators", 50, 400),
+        "learning_rate": trial.suggest_float("learning_rate", 0.005, 0.4, log=True),
+        "max_depth": trial.suggest_int("max_depth", 2, 10),
+        "min_child_weight": trial.suggest_int("min_child_weight", 1, 7),
+        "subsample": trial.suggest_float("subsample", 0.5, 1.0),
+        "colsample_bytree": trial.suggest_float("colsample_bytree", 0.5, 1.0),
+        "gamma": trial.suggest_float("gamma", 0.0, 5.0),
+        "reg_alpha": trial.suggest_float("reg_alpha", 1e-5, 1.0, log=True),
+        "reg_lambda": trial.suggest_float("reg_lambda", 1e-5, 1.0, log=True)
+    }
+
+    model = xgb.XGBRegressor(
+        **param,
+        objective="reg:squarederror",
+        random_state=42,
+        n_jobs=-1,
+        verbosity=0
+    )
+
+    model.fit(X_train, y_train)
+    y_pred = model.predict(X_val)
+
+    # You can choose to minimize MSE or maximize R²
+    mse = mean_squared_error(y_val, y_pred)
+    return mse  # Minimizing MSE
+
+# Run optimization for each target
+search_results = []
+for target in TARGET_COLS:
+    print(f"\nTuning for target: {target}")
+
+    # Create study for this target
+    study = optuna.create_study(direction="minimize")
+
+    # Use partial function to pass the data
+    import functools
+    objective_with_data = functools.partial(
+        objective,
+        X_train=X_train_p,
+        y_train=y_train[target].values,
+        X_val=X_val_p,
+        y_val=y_val[target].values
+    )
+
+    # Run optimization
+    study.optimize(objective_with_data, n_trials=100)  # Adjust n_trials as needed
+
+    print(f"Best parameters for {target}: {study.best_params}")
+    print(f"Best MSE: {study.best_value:.4f}")
+
+    # Evaluate best model on validation set
+    best_model = xgb.XGBRegressor(
+        **study.best_params,
+        objective="reg:squarederror",
+        random_state=42,
+        n_jobs=-1,
+        verbosity=0
+    )
+    best_model.fit(X_train_p, y_train[target].values)
+
+    y_val_pred = best_model.predict(X_val_p)
+    r2 = r2_score(y_val[target].values, y_val_pred)
+
+    # Save results
+    search_results.append({
+        "Target": target,
+        "Best_Score_CV": study.best_value,
+        "Best_R2_Val": r2,
+        "Best_Params": json.dumps(study.best_params)
+    })
+
+    # Save the best estimator
+    joblib.dump(best_model, f"xgb_optuna_best_{target.replace(' ','_')}.pkl")
+
+# Save best params summary
+best_params_df = pd.DataFrame(search_results)
+best_params_df.to_csv("xgb_optuna_best_params.csv", index=False)
+print("\nSaved xgb_optuna_best_params.csv")
+print(best_params_df)
+
+# Create a simplified CSV with just the best parameters for easy loading
+simple_best_params = []
+for target in TARGET_COLS:
+    params = json.loads(best_params_df[best_params_df["Target"] == target]["Best_Params"].iloc[0])
+    params["Target"] = target
+    simple_best_params.append(params)
+
+simple_best_df = pd.DataFrame(simple_best_params)
+simple_best_df.to_csv("best_params_simple.csv", index=False)
+print("\nSaved simplified best_params_simple.csv")
+print(simple_best_df)
+
+Stage 6 — Final training (train+val) and test evaluation, SHAP explanations
+
+from google.colab import files
+uploaded = files.upload()
+
+# Stage 6: Final training (train+val) → test evaluation + SHAP
+import joblib
+from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
+import numpy as np
+import shap
+import matplotlib.pyplot as plt
+import pandas as pd
+import xgboost as xgb
+import json
+import os
+
+# Check if best_params.csv exists, if not use default parameters
+if os.path.exists("best_params.csv"):
+    best_params_df = pd.read_csv("best_params.csv")
+    best_params = best_params_df.iloc[0].to_dict()
+
+    # Convert parameters to appropriate data types
+    best_params_converted = {
+        'n_estimators': int(best_params['n_estimators']),
+        'learning_rate': float(best_params['learning_rate']),
+        'max_depth': int(best_params['max_depth']),
+        'min_child_weight': int(best_params['min_child_weight']),
+        'subsample': float(best_params['subsample']),
+        'colsample_bytree': float(best_params['colsample_bytree'])
+    }
+    print(f"Using optimized hyperparameters: {best_params_converted}")
+else:
+    # Use default parameters if no optimized parameters file exists
+    print("best_params.csv not found. Using default hyperparameters.")
+    best_params_converted = {
+        'n_estimators': 100,
+        'learning_rate': 0.1,
+        'max_depth': 6,
+        'min_child_weight': 1,
+        'subsample': 0.8,
+        'colsample_bytree': 0.8
+    }
+    print(f"Using default hyperparameters: {best_params_converted}")
+
+# Define targets - make sure this matches your data
+# If you're getting an error here, check if TARGET_COLS is defined
+# If not, define it manually:
+if 'TARGET_COLS' not in locals() and 'TARGET_COLS' not in globals():
+    TARGET_COLS = ['DOP', 'Width', 'Aspect Ratio']  # Adjust based on your actual target column names
+
+targets = TARGET_COLS
+final_results = []
+
+for target in targets:
+    print(f"\nFinal training for: {target} with params: {best_params_converted}")
+
+    # Build model with best params
+    model = xgb.XGBRegressor(
+        **best_params_converted,
+        objective="reg:squarederror",
+        random_state=42,
+        n_jobs=-1,
+        verbosity=0
+    )
+
+    # Train on train + val
+    X_trainval_p = np.vstack([X_train_p, X_val_p])
+    y_trainval = np.concatenate([y_train[target].values, y_val[target].values])
+    model.fit(X_trainval_p, y_trainval)
+
+    # Test predictions
+    y_test_pred = model.predict(X_test_p)
+    y_test_true = y_test[target].values
+
+    # Calculate metrics
+    r2 = r2_score(y_test_true, y_test_pred)
+    rmse = np.sqrt(mean_squared_error(y_test_true, y_test_pred))
+    mae = mean_absolute_error(y_test_true, y_test_pred)
+
+    final_results.append({"Target": target, "R2_Test": r2, "RMSE_Test": rmse, "MAE_Test": mae})
+
+    # Save model
+    joblib.dump(model, f"xgb_final_{target.replace(' ','_')}.pkl")
+    print(f"Saved model: xgb_final_{target.replace(' ','_')}.pkl")
+    print(f"Test metrics — R2: {r2:.3f}, RMSE: {rmse:.3f}, MAE: {mae:.3f}")
+
+    # Actual vs Predicted plot
+    plt.figure(figsize=(5,5))
+    plt.scatter(y_test_true, y_test_pred, alpha=0.8, edgecolors="k")
+    lims = [min(min(y_test_true), min(y_test_pred)), max(max(y_test_true), max(y_test_pred))]
+    plt.plot(lims, lims, 'r--')
+    plt.xlabel("Actual")
+    plt.ylabel("Predicted")
+    plt.title(f"{target} — Actual vs Predicted (R²={r2:.2f})")
+    plt.tight_layout()
+    plt.savefig(f"actual_vs_pred_{target.replace(' ','_')}.png", dpi=300)
+    plt.show()
+
+    # SHAP explanation (TreeExplainer)
+    try:
+        explainer = shap.TreeExplainer(model)
+        shap_values = explainer.shap_values(X_test_p)
+        shap.summary_plot(shap_values, X_test_p, feature_names=feature_names, show=False)
+        plt.title(f"SHAP summary — {target}")
+        plt.tight_layout()
+        plt.savefig(f"shap_summary_{target.replace(' ','_')}.png", dpi=600)
+        plt.show()
+    except Exception as e:
+        print("SHAP failed:", e)
+
+# Save final metrics
+final_df = pd.DataFrame(final_results)
+final_df.to_csv("xgb_final_results.csv", index=False)
+print("\nFinal results saved to xgb_final_results.csv")
+print(final_df)
+
+To add uncertainty estimation to your XGBoost project, you can implement several approaches. I'll show you where and how to add uncertainty estimation to your existing code.
+Option 1: Quantile Regression (Recommended)
+
+Add this after your main model training in Stage 6
+
+# Add to your imports at the top
+from xgboost import XGBRegressor
+
+# Add this after your main model training in Stage 6
+print(f"\nTraining quantile models for uncertainty estimation: {target}")
+
+# Train models for different quantiles
+quantiles = [0.05, 0.5, 0.95]  # 5th, 50th (median), and 95th percentiles
+quantile_models = {}
+
+for q in quantiles:
+    # Create and train quantile model
+    q_model = XGBRegressor(
+        **best_params_converted,
+        objective=f"reg:quantileerror",
+        quantile_alpha=q,
+        random_state=42,
+        n_jobs=-1,
+        verbosity=0
+    )
+    q_model.fit(X_trainval_p, y_trainval)
+    quantile_models[q] = q_model
+
+    # Save quantile model
+    joblib.dump(q_model, f"xgb_quantile_{q}_{target.replace(' ','_')}.pkl")
+
+# Make predictions with all quantile models
+y_test_pred_lower = quantile_models[0.05].predict(X_test_p)
+y_test_pred_median = quantile_models[0.5].predict(X_test_p)
+y_test_pred_upper = quantile_models[0.95].predict(X_test_p)
+
+# Calculate prediction intervals
+prediction_interval_width = y_test_pred_upper - y_test_pred_lower
+avg_interval_width = np.mean(prediction_interval_width)
+
+# Calculate coverage probability (percentage of true values within the 90% prediction interval)
+in_interval = (y_test_true >= y_test_pred_lower) & (y_test_true <= y_test_pred_upper)
+coverage = np.mean(in_interval) * 100
+
+print(f"Uncertainty metrics — Avg. 90% Interval Width: {avg_interval_width:.3f}, Coverage: {coverage:.1f}%")
+
+# Add uncertainty metrics to final results
+final_results[-1]["Interval_Width"] = avg_interval_width
+final_results[-1]["Coverage_%"] = coverage
+
+# Plot with prediction intervals (for a subset of points)
+plt.figure(figsize=(10, 6))
+indices = np.arange(len(y_test_true))[:50]  # First 50 points
+
+plt.errorbar(
+    indices,
+    y_test_pred_median[:50],
+    yerr=[y_test_pred_median[:50] - y_test_pred_lower[:50],
+          y_test_pred_upper[:50] - y_test_pred_median[:50]],
+    fmt='o',
+    label='Predicted with 90% interval'
+)
+plt.plot(indices, y_test_true[:50], 'ro', label='Actual')
+plt.xlabel('Sample Index')
+plt.ylabel(target)
+plt.title(f'{target} - Predictions with Uncertainty Intervals')
+plt.legend()
+plt.tight_layout()
+plt.savefig(f"uncertainty_intervals_{target.replace(' ','_')}.png", dpi=300)
+plt.show()
+
+Stage 7 — Compare models (baseline vs XGB)
+
+Optional — compares baseline Ridge vs XGBoost test performance and saves combined file
+
+# Stage 7: Comparison plots and table
+import pandas as pd
+import seaborn as sns
+import matplotlib.pyplot as plt
+import numpy as np
+
+# Load results
+ridge_df = pd.read_csv("baseline_ridge_results.csv")
+xgb_df = pd.read_csv("xgb_final_results.csv")
+
+# Keep only test rows for ridge baseline
+ridge_test = ridge_df[ridge_df["Split"] == "test"].copy()
+ridge_test = ridge_test.rename(columns={"R2": "R2", "RMSE": "RMSE", "MAE": "MAE"})
+ridge_test = ridge_test[["Target", "R2", "RMSE", "MAE"]]
+ridge_test["Model"] = "Ridge"
+
+# Prepare XGB results
+xgb_df = xgb_df.rename(columns={"R2_Test": "R2", "RMSE_Test": "RMSE", "MAE_Test": "MAE"})
+xgb_df["Model"] = "XGB"
+
+# Combine results
+combined = pd.concat([ridge_test, xgb_df[["Target", "R2", "RMSE", "MAE", "Model"]]], ignore_index=True)
+combined.to_csv("models_comparison.csv", index=False)
+
+# Create comparison plots
+fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+
+# R² comparison
+sns.barplot(data=combined, x="Target", y="R2", hue="Model", ax=axes[0])
+axes[0].set_title("R² Comparison (Test Set)")
+axes[0].set_ylabel("R² Score")
+axes[0].set_ylim(0, 1)  # R² typically between 0 and 1
+
+# RMSE comparison
+sns.barplot(data=combined, x="Target", y="RMSE", hue="Model", ax=axes[1])
+axes[1].set_title("RMSE Comparison (Test Set)")
+axes[1].set_ylabel("RMSE")
+
+# MAE comparison
+sns.barplot(data=combined, x="Target", y="MAE", hue="Model", ax=axes[2])
+axes[2].set_title("MAE Comparison (Test Set)")
+axes[2].set_ylabel("MAE")
+
+plt.tight_layout()
+plt.savefig("model_comparison_metrics.png", dpi=300, bbox_inches='tight')
+plt.show()
+
+# Calculate improvement percentages
+improvement_df = pd.DataFrame()
+for target in combined['Target'].unique():
+    ridge_metrics = combined[(combined['Target'] == target) & (combined['Model'] == 'Ridge')].iloc[0]
+    xgb_metrics = combined[(combined['Target'] == target) & (combined['Model'] == 'XGB')].iloc[0]
+
+    r2_improvement = ((xgb_metrics['R2'] - ridge_metrics['R2']) / ridge_metrics['R2']) * 100
+    rmse_improvement = ((ridge_metrics['RMSE'] - xgb_metrics['RMSE']) / ridge_metrics['RMSE']) * 100
+    mae_improvement = ((ridge_metrics['MAE'] - xgb_metrics['MAE']) / ridge_metrics['MAE']) * 100
+
+    improvement_df = pd.concat([improvement_df, pd.DataFrame({
+        'Target': [target],
+        'R2_Improvement_%': [r2_improvement],
+        'RMSE_Improvement_%': [rmse_improvement],
+        'MAE_Improvement_%': [mae_improvement]
+    })], ignore_index=True)
+
+print("\nImprovement of XGB over Ridge Baseline:")
+print(improvement_df.round(2))
+
+# Save improvement table
+improvement_df.to_csv("model_improvement_summary.csv", index=False)
+
+# Create a radar chart for comparison
+def create_radar_chart(ridge_metrics, xgb_metrics, targets, metrics):
+    # Number of variables we're plotting
+    num_vars = len(metrics)
+
+    # Split the circle into even parts and save the angles
+    angles = np.linspace(0, 2 * np.pi, num_vars, endpoint=False).tolist()
+
+    # The plot is circular, so we need to "complete the loop" and append the start to the end
+    ridge_metrics += ridge_metrics[:1]
+    xgb_metrics += xgb_metrics[:1]
+    angles += angles[:1]
+
+    # Initialize the figure
+    fig, ax = plt.subplots(figsize=(8, 8), subplot_kw=dict(polar=True))
+
+    # Draw one axe per variable and add labels
+    plt.xticks(angles[:-1], metrics)
+
+    # Plot Ridge data
+    ax.plot(angles, ridge_metrics, linewidth=1, linestyle='solid', label='Ridge')
+    ax.fill(angles, ridge_metrics, alpha=0.25)
+
+    # Plot XGB data
+    ax.plot(angles, xgb_metrics, linewidth=1, linestyle='solid', label='XGB')
+    ax.fill(angles, xgb_metrics, alpha=0.25)
+
+    # Add legend
+    ax.legend(loc='upper right', bbox_to_anchor=(0.1, 0.1))
+
+    # Add a title
+    plt.title(f'Model Comparison Radar Chart\nfor {targets}', size=16, y=1.1)
+
+    # Show plot
+    plt.tight_layout()
+    plt.savefig(f"radar_comparison_{targets.replace(' ', '_')}.png", dpi=300, bbox_inches='tight')
+    plt.show()
+
+# Create radar charts for each target
+for target in combined['Target'].unique():
+    ridge_vals = combined[(combined['Target'] == target) & (combined['Model'] == 'Ridge')][['R2', 'RMSE', 'MAE']].values[0]
+    xgb_vals = combined[(combined['Target'] == target) & (combined['Model'] == 'XGB')][['R2', 'RMSE', 'MAE']].values[0]
+
+    # Normalize values for radar chart (inverse for error metrics)
+    ridge_normalized = [ridge_vals[0], 1 - ridge_vals[1]/max(ridge_vals[1], xgb_vals[1]), 1 - ridge_vals[2]/max(ridge_vals[2], xgb_vals[2])]
+    xgb_normalized = [xgb_vals[0], 1 - xgb_vals[1]/max(ridge_vals[1], xgb_vals[1]), 1 - xgb_vals[2]/max(ridge_vals[2], xgb_vals[2])]
+
+    create_radar_chart(ridge_normalized, xgb_normalized, target, ['R²', 'RMSE', 'MAE'])
+
+pivoted = combined.pivot(index="Target", columns="Model", values="R2")
+sns.heatmap(pivoted, annot=True, cmap="YlGnBu", fmt=".2f")
+plt.title("Heatmap of R² Scores per Target & Model")
+plt.show()
+
+
